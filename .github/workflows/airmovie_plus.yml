@@ -1,0 +1,928 @@
+# Arquivo ÚNICO.  Caminho no GitHub:  .github/workflows/airmovie_plus.yml
+# Depois de salvar: aba Actions > airmovie_plus > Run workflow.
+# Ao terminar (~2 min), baixe o artefato "AirMoviePlus" (contém AirMoviePlus.dylib).
+# No app: toque com 3 dedos na tela para abrir o painel de testes.
+
+name: airmovie_plus
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Criar AirMoviePlus.m
+        run: |
+          cat > AirMoviePlus.m <<'AM_EOF'
+          // AirMoviePlus.m  (tweak dedicado ao Air Movie / AirCatch)
+          //
+          // O player do app é o SJVideoPlayer (prefixo OS) com o motor IJKPlayer (FFmpeg).
+          //
+          //  1) Hardware até 4K: o app deixa a decodificação por hardware (VideoToolbox)
+          //     limitada a vídeos de até 960 px de largura, então 1080p roda em software
+          //     (CPU alta, esquenta, trava). Aqui o limite sobe para 4096 px.
+          //  2) Até 60 fps (o app limita em 30) e buffer maior (menos travadas).
+          //  3) Qualidade: se o vídeo for HLS com várias qualidades, escolhe sozinho a
+          //     MÁXIMA até 1080p e mostra um botão para trocar (toque no vídeo para ver).
+          //  4) 120 Hz nas animações e no scroll (precisa da chave no Info.plist do IPA).
+          //  5) Controles do player em português quando o idioma do app for português.
+          //  6) Estatísticas ao vivo no vídeo (opcional): resolução, codec, bitrate, fps
+          //     e se a decodificação está em hardware. Mostra a qualidade REAL do stream.
+          //
+          //  PAINEL DE TESTES: toque com 3 dedos. Liga/desliga cada recurso e mostra um
+          //  diagnóstico (decodificador em uso, qualidades encontradas, ganchos ativos).
+          //
+          // Sem Substrate: tudo via runtime do Objective-C, carregado na abertura do app.
+
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <objc/runtime.h>
+          #import <objc/message.h>
+          #include <string.h>
+
+          #pragma mark - Opções (liga/desliga)
+
+          typedef NS_ENUM(int, AMFlag) {
+              AMFHW = 0,
+              AMFFps60,
+              AMFBuffer,
+              AMFCap,
+              AMFQBtn,
+              AMFHz120,
+              AMFPlayerPT,
+              AMFStats,
+              AMFCount
+          };
+
+          static BOOL gOn[AMFCount];
+          static const BOOL kFlagDefault[AMFCount] = { YES, YES, YES, YES, YES, YES, YES, NO };
+          static NSString *const kFlagTitles[AMFCount] = {
+              @"Hardware até 4K (1080p sem travar)",
+              @"Até 60 fps",
+              @"Buffer maior (menos travadas)",
+              @"Limite de 1080p automático",
+              @"Botão de qualidade",
+              @"120 Hz",
+              @"Controles do player em português",
+              @"Estatísticas do vídeo na tela"
+          };
+
+          static NSString *AMFlagKey(int i) {
+              return [NSString stringWithFormat:@"am_flag_v2_%d", i];
+          }
+
+          static void AMLoadFlags(void) {
+              NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+              for (int i = 0; i < AMFCount; i++) {
+                  id v = [ud objectForKey:AMFlagKey(i)];
+                  gOn[i] = v ? [v boolValue] : kFlagDefault[i];
+              }
+          }
+
+          static const void *kWindowKey = &kWindowKey;
+          static const void *kPlayerTapKey = &kPlayerTapKey;
+          static const void *kAnimKey = &kAnimKey;
+
+          static __weak id gPlayer = nil;     // OSVideoPlayer em uso
+          static __weak id gIJK = nil;        // IJKFFMoviePlayerController em uso
+          static BOOL gSwitching = NO;
+
+          #pragma mark - Hook genérico (com registro para o diagnóstico)
+
+          static int gHooksOK = 0;
+          static int gHooksTotal = 0;
+          static NSMutableString *gHooksFailed = nil;
+
+          // Troca a implementação de um método SÓ se ele pertence mesmo à classe
+          // (não mexe em método herdado, para não afetar a superclasse).
+          static BOOL AMHook(Class cls, SEL sel, IMP imp, IMP *orig) {
+              gHooksTotal++;
+              BOOL ok = NO;
+              Method m = (cls && sel) ? class_getInstanceMethod(cls, sel) : NULL;
+              if (m && imp && orig) {
+                  BOOL inherited = NO;
+                  Class sup = class_getSuperclass(cls);
+                  if (sup) {
+                      Method sm = class_getInstanceMethod(sup, sel);
+                      if (sm && method_getImplementation(sm) == method_getImplementation(m)) inherited = YES;
+                  }
+                  if (!inherited) {
+                      *orig = method_setImplementation(m, imp);
+                      ok = (*orig != NULL);
+                  }
+              }
+              if (ok) {
+                  gHooksOK++;
+              } else {
+                  if (!gHooksFailed) gHooksFailed = [NSMutableString string];
+                  [gHooksFailed appendFormat:@"%@%@.%@", gHooksFailed.length ? @", " : @"",
+                   cls ? NSStringFromClass(cls) : @"?", sel ? NSStringFromSelector(sel) : @"?"];
+              }
+              return ok;
+          }
+
+          #pragma mark - Helpers de janela e controlador
+
+          static NSArray<UIWindow *> *AMAllWindows(void) {
+              NSMutableArray<UIWindow *> *out = [NSMutableArray array];
+              UIApplication *app = [UIApplication sharedApplication];
+              if (!app) return out;
+              if (@available(iOS 13.0, *)) {
+                  for (UIScene *sc in app.connectedScenes) {
+                      if ([sc isKindOfClass:[UIWindowScene class]]) {
+                          [out addObjectsFromArray:((UIWindowScene *)sc).windows];
+                      }
+                  }
+              }
+              if (out.count == 0) {
+                  [out addObjectsFromArray:app.windows];
+              }
+              return out;
+          }
+
+          static UIViewController *AMTopController(void) {
+              UIWindow *key = nil;
+              NSArray<UIWindow *> *all = AMAllWindows();
+              for (UIWindow *w in all) {
+                  if (w.isKeyWindow) {
+                      key = w;
+                      break;
+                  }
+              }
+              if (!key) key = all.firstObject;
+              UIViewController *vc = key.rootViewController;
+              while (vc.presentedViewController && !vc.presentedViewController.isBeingDismissed) {
+                  vc = vc.presentedViewController;
+              }
+              return vc;
+          }
+
+          static UIViewController *AMControllerForView(UIView *v) {
+              UIResponder *r = v;
+              while (r) {
+                  if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
+                  r = r.nextResponder;
+              }
+              return nil;
+          }
+
+          static UIViewController *AMTopFrom(UIViewController *vc) {
+              while (vc.presentedViewController && !vc.presentedViewController.isBeingDismissed) {
+                  vc = vc.presentedViewController;
+              }
+              return vc;
+          }
+
+          // Idioma atual do app (o mesmo código que o app envia ao servidor).
+          static NSString *AMAppLanguage(void) {
+              Class C = NSClassFromString(@"AICoderSection");
+              SEL s = NSSelectorFromString(@"aircatchTriggerExtensionDoDefault");
+              if (C && [C respondsToSelector:s]) {
+                  id r = ((id (*)(id, SEL))objc_msgSend)(C, s);
+                  if ([r isKindOfClass:[NSString class]]) return r;
+              }
+              return nil;
+          }
+
+          #pragma mark - IJK: decodificação por hardware, 60 fps e buffer
+
+          static IMP s_origIJKInitStr = NULL;
+          static IMP s_origIJKInitURL = NULL;
+
+          static void AMSetPlayerInt(id opts, NSString *key, int64_t v) {
+              SEL s = NSSelectorFromString(@"setPlayerOptionIntValue:forKey:");
+              if ([opts respondsToSelector:s]) {
+                  ((void (*)(id, SEL, int64_t, id))objc_msgSend)(opts, s, v, key);
+              }
+          }
+
+          // opts é o IJKFFOptions que o app montou; mexemos antes do player nascer.
+          static void AMTuneIJK(id opts) {
+              if (!opts) return;
+              @try {
+                  // O padrão era 960 px: acima disso o IJK abandonava o hardware (CPU).
+                  if (gOn[AMFHW]) AMSetPlayerInt(opts, @"videotoolbox-max-frame-width", 4096);
+                  if (gOn[AMFFps60]) AMSetPlayerInt(opts, @"max-fps", 60);
+                  if (gOn[AMFBuffer]) AMSetPlayerInt(opts, @"max-buffer-size", 32 * 1024 * 1024);
+              } @catch (NSException *e) {
+              }
+          }
+
+          static id AMIJKInitStr(id me, SEL sel, id url, id opts) {
+              AMTuneIJK(opts);
+              id r = ((id (*)(id, SEL, id, id))s_origIJKInitStr)(me, sel, url, opts);
+              if (r) gIJK = r;
+              return r;
+          }
+
+          static id AMIJKInitURL(id me, SEL sel, id url, id opts) {
+              AMTuneIJK(opts);
+              id r = ((id (*)(id, SEL, id, id))s_origIJKInitURL)(me, sel, url, opts);
+              if (r) gIJK = r;
+              return r;
+          }
+
+          static void AMInstallIJKHooks(void) {
+              Class c = NSClassFromString(@"IJKFFMoviePlayerController");
+              if (!c) return;
+              AMHook(c, NSSelectorFromString(@"initWithContentURLString:withOptions:"),
+                     (IMP)AMIJKInitStr, &s_origIJKInitStr);
+              AMHook(c, NSSelectorFromString(@"initWithContentURL:withOptions:"),
+                     (IMP)AMIJKInitURL, &s_origIJKInitURL);
+          }
+
+          #pragma mark - Qualidade (HLS)
+
+          @interface AMVariant : NSObject
+          @property (nonatomic, strong) NSURL *url;
+          @property (nonatomic) NSInteger width;
+          @property (nonatomic) NSInteger height;
+          @property (nonatomic) NSInteger bandwidth;
+          - (NSString *)label;
+          @end
+
+          @implementation AMVariant
+          - (NSString *)label {
+              if (self.height > 0) return [NSString stringWithFormat:@"%ldp", (long)self.height];
+              if (self.bandwidth > 0) return [NSString stringWithFormat:@"%.1f Mbps", self.bandwidth / 1000000.0];
+              return @"?";
+          }
+          @end
+
+          @interface AMHandler : NSObject <UIGestureRecognizerDelegate>
+          + (instancetype)shared;
+          - (void)onThreeFingerTap:(UITapGestureRecognizer *)g;
+          - (void)onPlayerTap:(UITapGestureRecognizer *)g;
+          - (void)onQualityButton:(UIButton *)b;
+          - (void)revealButton;
+          @end
+
+          static NSArray<AMVariant *> *gVariants = nil;   // ordenadas da maior para a menor
+          static BOOL gHasSepAudio = NO;                  // áudio em arquivo separado: não mexe
+          static AMVariant *gPlaying = nil;               // qualidade em uso (nil = lista mestre)
+          static AMVariant *gChosen = nil;                // escolha manual (nil = automático)
+          static NSString *gQualityNote = @"nenhum vídeo analisado ainda";
+          static NSString *gLastURLSafe = nil;
+          static UIButton *gQBtn = nil;
+
+          static NSString *AMSafeURLString(NSURL *u) {
+              if (!u) return @"(sem URL)";
+              NSString *s = [NSString stringWithFormat:@"%@%@", u.host ?: @"", u.path ?: @""];
+              return s.length > 140 ? [s substringToIndex:140] : s;
+          }
+
+          static NSString *AMGroup(NSString *pattern, NSString *s) {
+              NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:pattern
+                                                                                  options:NSRegularExpressionCaseInsensitive
+                                                                                    error:nil];
+              NSTextCheckingResult *m = [rx firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
+              if (!m || m.numberOfRanges < 2) return nil;
+              NSRange r = [m rangeAtIndex:1];
+              return r.location == NSNotFound ? nil : [s substringWithRange:r];
+          }
+
+          static NSString *AMFetchText(NSURL *url, NSTimeInterval timeout) {
+              __block NSString *result = nil;
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              NSMutableURLRequest *req =
+                  [NSMutableURLRequest requestWithURL:url
+                                          cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                      timeoutInterval:timeout];
+              [req setValue:@"ijkplayer" forHTTPHeaderField:@"User-Agent"];
+              NSURLSessionDataTask *task =
+                  [[NSURLSession sharedSession] dataTaskWithRequest:req
+                                                  completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+                      if (d.length > 0 && d.length < 2 * 1024 * 1024) {
+                          result = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                      }
+                      dispatch_semaphore_signal(sem);
+                  }];
+              [task resume];
+              dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeout + 0.2) * NSEC_PER_SEC)));
+              return result;
+          }
+
+          static NSArray<AMVariant *> *AMParseMaster(NSString *text, NSURL *base, BOOL *hasSepAudio) {
+              NSMutableArray<AMVariant *> *all = [NSMutableArray array];
+              NSString *pending = nil;
+              NSCharacterSet *nl = [NSCharacterSet newlineCharacterSet];
+              NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+              for (NSString *raw in [text componentsSeparatedByCharactersInSet:nl]) {
+                  NSString *line = [raw stringByTrimmingCharactersInSet:ws];
+                  if (!line.length) continue;
+                  if ([line hasPrefix:@"#EXT-X-MEDIA:"]) {
+                      NSString *u = line.uppercaseString;
+                      if ([u containsString:@"TYPE=AUDIO"] && [u containsString:@"URI="]) *hasSepAudio = YES;
+                      continue;
+                  }
+                  if ([line hasPrefix:@"#EXT-X-STREAM-INF:"]) {
+                      pending = line;
+                      continue;
+                  }
+                  if ([line hasPrefix:@"#"]) continue;
+                  if (pending) {
+                      AMVariant *v = [AMVariant new];
+                      v.url = [NSURL URLWithString:line relativeToURL:base].absoluteURL;
+                      v.bandwidth = [AMGroup(@"[:,]BANDWIDTH=(\\d+)", pending) integerValue];
+                      NSRegularExpression *rx =
+                          [NSRegularExpression regularExpressionWithPattern:@"RESOLUTION=(\\d+)x(\\d+)"
+                                                                    options:NSRegularExpressionCaseInsensitive
+                                                                      error:nil];
+                      NSTextCheckingResult *m = [rx firstMatchInString:pending options:0 range:NSMakeRange(0, pending.length)];
+                      if (m && m.numberOfRanges >= 3) {
+                          v.width = [[pending substringWithRange:[m rangeAtIndex:1]] integerValue];
+                          v.height = [[pending substringWithRange:[m rangeAtIndex:2]] integerValue];
+                      }
+                      if (v.url) [all addObject:v];
+                      pending = nil;
+                  }
+              }
+              [all sortUsingComparator:^NSComparisonResult(AMVariant *a, AMVariant *b) {
+                  if (a.height != b.height) return a.height > b.height ? NSOrderedAscending : NSOrderedDescending;
+                  if (a.bandwidth != b.bandwidth) return a.bandwidth > b.bandwidth ? NSOrderedAscending : NSOrderedDescending;
+                  return NSOrderedSame;
+              }];
+              // uma por altura (a de maior bitrate)
+              NSMutableArray<AMVariant *> *out = [NSMutableArray array];
+              NSMutableSet<NSNumber *> *seen = [NSMutableSet set];
+              for (AMVariant *v in all) {
+                  if (v.height > 0) {
+                      NSNumber *k = @(v.height);
+                      if ([seen containsObject:k]) continue;
+                      [seen addObject:k];
+                  }
+                  [out addObject:v];
+              }
+              return out;
+          }
+
+          // Melhor qualidade com altura <= limit (ou nil se não houver resolução informada).
+          static AMVariant *AMBestUnder(NSInteger limit) {
+              for (AMVariant *v in gVariants) {
+                  if (v.height > 0 && v.height <= limit) return v;
+              }
+              return nil;
+          }
+
+          // Baixa a lista do vídeo e descobre as qualidades. Bloqueia no máximo ~1,7 s.
+          static void AMAnalyze(NSURL *url) {
+              gVariants = nil;
+              gHasSepAudio = NO;
+              gPlaying = nil;
+              gChosen = nil;
+              gLastURLSafe = AMSafeURLString(url);
+              if (!url) {
+                  gQualityNote = @"sem URL do vídeo";
+                  return;
+              }
+              NSString *ext = url.path.pathExtension.lowercaseString;
+              if (![ext isEqualToString:@"m3u8"]) {
+                  gQualityNote = [NSString stringWithFormat:@"arquivo .%@ (não é HLS): qualidade única", ext.length ? ext : @"?"];
+                  return;
+              }
+              NSString *text = AMFetchText(url, 1.5);
+              if (!text) {
+                  gQualityNote = @"HLS, mas não consegui baixar a lista (segue como está)";
+                  return;
+              }
+              if (![text containsString:@"#EXT-X-STREAM-INF"]) {
+                  gQualityNote = @"HLS com uma só qualidade (lista simples)";
+                  return;
+              }
+              BOOL sep = NO;
+              NSArray<AMVariant *> *vars = AMParseMaster(text, url, &sep);
+              gHasSepAudio = sep;
+              if (vars.count < 2) {
+                  gQualityNote = @"HLS com uma só qualidade";
+                  return;
+              }
+              gVariants = vars;
+              NSMutableArray<NSString *> *labels = [NSMutableArray array];
+              for (AMVariant *v in vars) [labels addObject:v.label];
+              gQualityNote = [NSString stringWithFormat:@"HLS com %lu qualidades: %@%@", (unsigned long)vars.count,
+                              [labels componentsJoinedByString:@", "],
+                              sep ? @" (áudio separado: não troco)" : @""];
+          }
+
+          #pragma mark - Botão de qualidade
+
+          static UIView *AMPlayerView(id player) {
+              SEL s = NSSelectorFromString(@"view");
+              if (player && [player respondsToSelector:s]) {
+                  id v = ((id (*)(id, SEL))objc_msgSend)(player, s);
+                  if ([v isKindOfClass:[UIView class]]) return v;
+              }
+              return nil;
+          }
+
+          static void AMUpdateQualityButton(void) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  id player = gPlayer;
+                  BOOL show = gOn[AMFQBtn] && player && gVariants.count > 1 && !gHasSepAudio;
+                  if (!show) {
+                      [gQBtn removeFromSuperview];
+                      return;
+                  }
+                  UIView *pv = AMPlayerView(player);
+                  if (!pv) return;
+
+                  if (!gQBtn) {
+                      gQBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+                      gQBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+                      [gQBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                      gQBtn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+                      gQBtn.layer.cornerRadius = 15.0;
+                      gQBtn.layer.masksToBounds = YES;
+                      gQBtn.alpha = 0.0;
+                      [gQBtn addTarget:[AMHandler shared]
+                                action:@selector(onQualityButton:)
+                      forControlEvents:UIControlEventTouchUpInside];
+                  }
+                  NSString *title = gPlaying ? gPlaying.label : @"Auto";
+                  [gQBtn setTitle:title forState:UIControlStateNormal];
+                  CGSize sz = [title sizeWithAttributes:@{ NSFontAttributeName : gQBtn.titleLabel.font }];
+                  CGFloat w = MAX(52.0, sz.width + 24.0);
+                  CGFloat x = pv.bounds.size.width - w - 14.0 - pv.safeAreaInsets.right;
+                  CGFloat y = pv.bounds.size.height * 0.28;
+                  gQBtn.frame = CGRectMake(x, y, w, 30.0);
+                  gQBtn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+                  if (gQBtn.superview != pv) {
+                      [pv addSubview:gQBtn];
+                  }
+                  if (!objc_getAssociatedObject(pv, kPlayerTapKey)) {
+                      UITapGestureRecognizer *tap =
+                          [[UITapGestureRecognizer alloc] initWithTarget:[AMHandler shared] action:@selector(onPlayerTap:)];
+                      tap.cancelsTouchesInView = NO;
+                      tap.delaysTouchesBegan = NO;
+                      tap.delaysTouchesEnded = NO;
+                      tap.delegate = [AMHandler shared];
+                      [pv addGestureRecognizer:tap];
+                      objc_setAssociatedObject(pv, kPlayerTapKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                  }
+                  [[AMHandler shared] revealButton];
+              });
+          }
+
+          // Troca a qualidade usando o mecanismo próprio do player (mantém a posição).
+          static void AMSwitchTo(AMVariant *choice) {
+              id player = gPlayer;
+              AMVariant *target = choice ?: AMBestUnder(1080);
+              if (!player || !target) return;
+              Class A = NSClassFromString(@"OSVideoPlayerURLAsset");
+              SEL initSel = NSSelectorFromString(@"initWithURL:");
+              SEL swSel = NSSelectorFromString(@"switchVideoDefinition:");
+              if (!A || ![A instancesRespondToSelector:initSel] || ![player respondsToSelector:swSel]) return;
+
+              id na = ((id (*)(id, SEL, id))objc_msgSend)([A alloc], initSel, target.url);
+              if (!na) return;
+              SEL fn = NSSelectorFromString(@"setDefinition_fullName:");
+              SEL ln = NSSelectorFromString(@"setDefinition_lastName:");
+              if ([na respondsToSelector:fn]) ((void (*)(id, SEL, id))objc_msgSend)(na, fn, target.label);
+              if ([na respondsToSelector:ln]) ((void (*)(id, SEL, id))objc_msgSend)(na, ln, target.label);
+
+              gSwitching = YES;
+              ((void (*)(id, SEL, id))objc_msgSend)(player, swSel, na);
+              gSwitching = NO;
+              gPlaying = target;
+              gChosen = choice;
+              AMUpdateQualityButton();
+          }
+
+          // Entra antes do vídeo começar: analisa a lista e já usa a melhor qualidade até 1080p.
+          static IMP s_origSetURLAsset = NULL;
+
+          static void AMSetURLAsset(id player, SEL sel, id asset) {
+              if (player) gPlayer = player;
+              if (asset && !gSwitching && (gOn[AMFCap] || gOn[AMFQBtn])) {
+                  SEL muSel = NSSelectorFromString(@"mediaURL");
+                  NSURL *u = [asset respondsToSelector:muSel] ? ((id (*)(id, SEL))objc_msgSend)(asset, muSel) : nil;
+                  BOOL known = NO;
+                  for (AMVariant *v in gVariants) {
+                      if ([v.url isEqual:u]) {
+                          known = YES;
+                          break;
+                      }
+                  }
+                  if (u && !known) {
+                      @try {
+                          AMAnalyze(u);
+                          if (gOn[AMFCap] && gVariants.count > 1 && !gHasSepAudio) {
+                              AMVariant *best = AMBestUnder(1080);
+                              SEL setSel = NSSelectorFromString(@"setMediaURL:");
+                              if (best && ![best.url isEqual:u] && [asset respondsToSelector:setSel]) {
+                                  ((void (*)(id, SEL, id))objc_msgSend)(asset, setSel, best.url);
+                                  gPlaying = best;
+                              }
+                          }
+                      } @catch (NSException *e) {
+                          gQualityNote = @"erro ao analisar o vídeo (ignorado, segue normal)";
+                      }
+                  }
+              }
+              ((void (*)(id, SEL, id))s_origSetURLAsset)(player, sel, asset);
+              AMUpdateQualityButton();
+          }
+
+          static void AMInstallQualityHooks(void) {
+              Class c = NSClassFromString(@"OSBaseVideoPlayer");
+              if (!c) return;
+              AMHook(c, NSSelectorFromString(@"setURLAsset:"), (IMP)AMSetURLAsset, &s_origSetURLAsset);
+          }
+
+          #pragma mark - Controles do player em português
+
+          static IMP s_origPrefBundle = NULL;
+
+          static NSBundle *AMPortugueseBundle(void) {
+              static NSBundle *b = nil;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{
+                  Class L = NSClassFromString(@"OSVideoPlayerResourceLoader");
+                  NSBundle *host = L ? [NSBundle bundleForClass:L] : [NSBundle mainBundle];
+                  NSString *bp = [host pathForResource:@"OSVideoPlayer" ofType:@"bundle"];
+                  NSBundle *pb = bp ? [NSBundle bundleWithPath:bp] : nil;
+                  NSString *lp = [pb pathForResource:@"pt" ofType:@"lproj"];
+                  if (lp) b = [NSBundle bundleWithPath:lp];
+              });
+              return b;
+          }
+
+          static id AMPrefBundle(id cls_, SEL sel) {
+              if (gOn[AMFPlayerPT] && [AMAppLanguage() isEqualToString:@"pt"]) {
+                  NSBundle *b = AMPortugueseBundle();
+                  if (b) return b;
+              }
+              return ((id (*)(id, SEL))s_origPrefBundle)(cls_, sel);
+          }
+
+          static void AMInstallPlayerLanguageHook(void) {
+              Class L = NSClassFromString(@"OSVideoPlayerResourceLoader");
+              if (!L) return;
+              AMHook(object_getClass(L), NSSelectorFromString(@"preferredLanguageBundle"),
+                     (IMP)AMPrefBundle, &s_origPrefBundle);
+          }
+
+          #pragma mark - 120 Hz
+
+          static IMP s_origDLAdd = NULL;
+          static IMP s_origDLFPS = NULL;
+          static IMP s_origAddAnim = NULL;
+
+          static void AMDLAdd(CADisplayLink *dl, SEL sel, NSRunLoop *rl, NSRunLoopMode mode) {
+              if (gOn[AMFHz120]) {
+                  if (@available(iOS 15.0, *)) {
+                      @try {
+                          dl.preferredFrameRateRange = CAFrameRateRangeMake(80.0, 120.0, 120.0);
+                      } @catch (NSException *e) {
+                      }
+                  }
+              }
+              ((void (*)(id, SEL, id, id))s_origDLAdd)(dl, sel, rl, mode);
+          }
+
+          static void AMDLSetFPS(CADisplayLink *dl, SEL sel, NSInteger fps) {
+              // 0 = maior taxa que a tela suporta.
+              ((void (*)(id, SEL, NSInteger))s_origDLFPS)(dl, sel, gOn[AMFHz120] ? 0 : fps);
+          }
+
+          static void AMAddAnim(CALayer *layer, SEL sel, CAAnimation *anim, NSString *key) {
+              if (anim && gOn[AMFHz120]) {
+                  if (@available(iOS 15.0, *)) {
+                      // O iOS lança exceção se a animação já foi usada (fica somente leitura).
+                      // O app reaproveita animações, então qualquer falha aqui é ignorada.
+                      @try {
+                          anim.preferredFrameRateRange = CAFrameRateRangeMake(80.0, 120.0, 120.0);
+                      } @catch (NSException *e) {
+                      }
+                  }
+              }
+              ((void (*)(id, SEL, id, id))s_origAddAnim)(layer, sel, anim, key);
+          }
+
+          static void AMInstallFrameRateHooks(void) {
+              AMHook([CADisplayLink class], NSSelectorFromString(@"addToRunLoop:forMode:"),
+                     (IMP)AMDLAdd, &s_origDLAdd);
+              AMHook([CADisplayLink class], NSSelectorFromString(@"setPreferredFramesPerSecond:"),
+                     (IMP)AMDLSetFPS, &s_origDLFPS);
+              AMHook([CALayer class], NSSelectorFromString(@"addAnimation:forKey:"),
+                     (IMP)AMAddAnim, &s_origAddAnim);
+          }
+
+          #pragma mark - Estatísticas do vídeo na tela
+
+          static UILabel *gStatsLabel = nil;
+          static NSTimer *gStatsTimer = nil;
+
+          static id AMKV(id obj, NSString *path) {
+              if (!obj) return nil;
+              @try {
+                  return [obj valueForKeyPath:path];
+              } @catch (NSException *e) {
+                  return nil;
+              }
+          }
+
+          // Texto com a qualidade REAL do stream em reprodução (nil se não houver vídeo).
+          static NSString *AMStatsText(void) {
+              id ij = gIJK;
+              if (!ij) return nil;
+              NSInteger w = [AMKV(ij, @"monitor.width") integerValue];
+              NSInteger h = [AMKV(ij, @"monitor.height") integerValue];
+              id codec = AMKV(ij, @"monitor.vcodec");
+              long long br = [AMKV(ij, @"monitor.bitrate") longLongValue];
+              float fps = [AMKV(ij, @"fpsAtOutput") floatValue];
+              if (fps <= 0.0f) fps = [AMKV(ij, @"monitor.fps") floatValue];
+              BOOL hw = [AMKV(ij, @"isVideoToolboxOpen") boolValue];
+
+              NSMutableArray<NSString *> *parts = [NSMutableArray array];
+              if (w > 0 && h > 0) [parts addObject:[NSString stringWithFormat:@"%ldx%ld", (long)w, (long)h]];
+              if ([codec isKindOfClass:[NSString class]] && [codec length]) [parts addObject:codec];
+              [parts addObject:hw ? @"HARDWARE" : @"software"];
+              if (fps > 0.0f) [parts addObject:[NSString stringWithFormat:@"%.0f fps", fps]];
+              if (br > 0) [parts addObject:[NSString stringWithFormat:@"%.1f Mbps", br / 1000000.0]];
+              return [parts componentsJoinedByString:@" • "];
+          }
+
+          static void AMUpdateStats(void) {
+              UIView *pv = AMPlayerView(gPlayer);
+              NSString *txt = (gOn[AMFStats] && pv) ? AMStatsText() : nil;
+              if (!txt) {
+                  gStatsLabel.hidden = YES;
+                  return;
+              }
+              if (!gStatsLabel) {
+                  gStatsLabel = [UILabel new];
+                  gStatsLabel.font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];
+                  gStatsLabel.textColor = [UIColor whiteColor];
+                  gStatsLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.6];
+                  gStatsLabel.layer.cornerRadius = 4.0;
+                  gStatsLabel.layer.masksToBounds = YES;
+                  gStatsLabel.userInteractionEnabled = NO;
+              }
+              if (gStatsLabel.superview != pv) [pv addSubview:gStatsLabel];
+              gStatsLabel.hidden = NO;
+              gStatsLabel.text = [NSString stringWithFormat:@" %@ ", txt];
+              [gStatsLabel sizeToFit];
+              CGFloat x = MAX(pv.safeAreaInsets.left, 8.0) + 8.0;
+              CGFloat y = MAX(pv.safeAreaInsets.top, 8.0) + 56.0;
+              gStatsLabel.frame = CGRectMake(x, y, gStatsLabel.bounds.size.width, 22.0);
+              [pv bringSubviewToFront:gStatsLabel];
+          }
+
+          static void AMApplyStatsFlag(void) {
+              if (gOn[AMFStats]) {
+                  if (!gStatsTimer) {
+                      gStatsTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+                          AMUpdateStats();
+                      }];
+                  }
+                  AMUpdateStats();
+              } else {
+                  [gStatsTimer invalidate];
+                  gStatsTimer = nil;
+                  gStatsLabel.hidden = YES;
+              }
+          }
+
+          #pragma mark - Painel de testes (toque com 3 dedos)
+
+          static NSString *AMDiagnosticText(void) {
+              NSMutableString *t = [NSMutableString string];
+              NSBundle *mb = [NSBundle mainBundle];
+              BOOL plist120 = [[mb objectForInfoDictionaryKey:@"CADisableMinimumFrameDurationOnPhone"] boolValue];
+
+              [t appendFormat:@"Tela: até %ld Hz\n", (long)[UIScreen mainScreen].maximumFramesPerSecond];
+              [t appendFormat:@"Pouca energia: %@\n", [NSProcessInfo processInfo].isLowPowerModeEnabled ? @"SIM (limita Hz)" : @"não"];
+              [t appendFormat:@"Info.plist 120 Hz: %@\n", plist120 ? @"sim" : @"NÃO"];
+              [t appendFormat:@"Idioma do app: %@\n", AMAppLanguage() ?: @"?"];
+              [t appendFormat:@"Ganchos: %d de %d ativos\n", gHooksOK, gHooksTotal];
+              if (gHooksFailed.length) [t appendFormat:@"Sem efeito: %@\n", gHooksFailed];
+
+              NSString *st = AMStatsText();
+              [t appendFormat:@"Vídeo agora: %@\n", st ?: @"nenhum vídeo ativo"];
+              [t appendFormat:@"Stream: %@\n", gQualityNote];
+              [t appendFormat:@"Qualidade em uso: %@", gPlaying ? gPlaying.label : @"automática (lista mestre)"];
+              return t;
+          }
+
+          static NSString *AMCopyText(void) {
+              NSMutableString *t = [NSMutableString stringWithString:AMDiagnosticText()];
+              [t appendFormat:@"\n\nURL (sem parâmetros): %@\n", gLastURLSafe ?: @"(nenhuma)"];
+              for (AMVariant *v in gVariants) {
+                  [t appendFormat:@"  %@  %ldx%ld  %.2f Mbps\n", v.label, (long)v.width, (long)v.height, v.bandwidth / 1000000.0];
+              }
+              return t;
+          }
+
+          static NSString *gPanelNote = nil;
+
+          static void AMShowPanel(void) {
+              UIViewController *top = AMTopController();
+              if (!top || [top isKindOfClass:[UIAlertController class]]) return;
+
+              NSString *msg = AMDiagnosticText();
+              if (gPanelNote.length) {
+                  msg = [NSString stringWithFormat:@"%@\n\n%@", gPanelNote, msg];
+                  gPanelNote = nil;
+              }
+              UIAlertController *ac =
+                  [UIAlertController alertControllerWithTitle:@"AirMoviePlus"
+                                                      message:msg
+                                               preferredStyle:UIAlertControllerStyleAlert];
+              for (int i = 0; i < AMFCount; i++) {
+                  int idx = i;
+                  NSString *title = [NSString stringWithFormat:@"%@ %@", gOn[i] ? @"✅" : @"⬜️", kFlagTitles[i]];
+                  [ac addAction:[UIAlertAction actionWithTitle:title
+                                                         style:UIAlertActionStyleDefault
+                                                       handler:^(UIAlertAction *action) {
+                      gOn[idx] = !gOn[idx];
+                      [[NSUserDefaults standardUserDefaults] setBool:gOn[idx] forKey:AMFlagKey(idx)];
+                      if (idx == AMFQBtn) AMUpdateQualityButton();
+                      if (idx == AMFStats) AMApplyStatsFlag();
+                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                                     dispatch_get_main_queue(), ^{
+                          AMShowPanel();
+                      });
+                  }]];
+              }
+              [ac addAction:[UIAlertAction actionWithTitle:@"📋 Copiar diagnóstico"
+                                                     style:UIAlertActionStyleDefault
+                                                   handler:^(UIAlertAction *action) {
+                  [UIPasteboard generalPasteboard].string = AMCopyText();
+                  gPanelNote = @"✔ Diagnóstico copiado. Cole na conversa.";
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), ^{
+                      AMShowPanel();
+                  });
+              }]];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Fechar" style:UIAlertActionStyleCancel handler:nil]];
+              [top presentViewController:ac animated:YES completion:nil];
+          }
+
+          #pragma mark - Gestos
+
+          @implementation AMHandler {
+              NSUInteger _gen;
+          }
+
+          + (instancetype)shared {
+              static AMHandler *s;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{ s = [AMHandler new]; });
+              return s;
+          }
+
+          - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
+              return YES;
+          }
+
+          - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+          shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+              return YES;
+          }
+
+          - (void)onThreeFingerTap:(UITapGestureRecognizer *)g {
+              if (g.state != UIGestureRecognizerStateEnded) return;
+              AMShowPanel();
+          }
+
+          // Toque no vídeo: mostra o botão de qualidade por alguns segundos.
+          - (void)onPlayerTap:(UITapGestureRecognizer *)g {
+              if (g.state != UIGestureRecognizerStateEnded) return;
+              if (!gQBtn || !gQBtn.superview) return;
+              [self revealButton];
+          }
+
+          - (void)revealButton {
+              NSUInteger gen = ++_gen;
+              [UIView animateWithDuration:0.2 animations:^{
+                  gQBtn.alpha = 1.0;
+              }];
+              __weak AMHandler *ws = self;
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                             dispatch_get_main_queue(), ^{
+                  AMHandler *s = ws;
+                  if (!s || s->_gen != gen) return;
+                  [UIView animateWithDuration:0.3 animations:^{
+                      gQBtn.alpha = 0.0;
+                  }];
+              });
+          }
+
+          - (void)onQualityButton:(UIButton *)b {
+              if (gVariants.count < 2) return;
+              [self revealButton];
+
+              UIAlertController *ac =
+                  [UIAlertController alertControllerWithTitle:@"Qualidade"
+                                                      message:@"Padrão: sempre a máxima, até 1080p"
+                                               preferredStyle:UIAlertControllerStyleActionSheet];
+              AMVariant *best = AMBestUnder(1080);
+              NSString *autoTitle = [NSString stringWithFormat:@"%@ Automático (máxima%@)",
+                                     gChosen == nil ? @"✅" : @"⬜️",
+                                     best ? [NSString stringWithFormat:@" • %@", best.label] : @""];
+              [ac addAction:[UIAlertAction actionWithTitle:autoTitle
+                                                     style:UIAlertActionStyleDefault
+                                                   handler:^(UIAlertAction *action) {
+                  AMSwitchTo(nil);
+              }]];
+              for (AMVariant *v in gVariants) {
+                  AMVariant *vv = v;
+                  BOOL sel = (gChosen == vv);
+                  NSString *t = [NSString stringWithFormat:@"%@ %@  (%.1f Mbps)",
+                                 sel ? @"✅" : @"⬜️", vv.label, vv.bandwidth / 1000000.0];
+                  [ac addAction:[UIAlertAction actionWithTitle:t
+                                                         style:UIAlertActionStyleDefault
+                                                       handler:^(UIAlertAction *action) {
+                      AMSwitchTo(vv);
+                  }]];
+              }
+              [ac addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
+
+              UIPopoverPresentationController *pop = ac.popoverPresentationController;
+              if (pop) {
+                  pop.sourceView = b;
+                  pop.sourceRect = b.bounds;
+              }
+              UIViewController *vc = AMTopFrom(AMControllerForView(b) ?: AMTopController());
+              [vc presentViewController:ac animated:YES completion:nil];
+          }
+
+          @end
+
+          #pragma mark - Instalação do gesto de 3 dedos (um por janela)
+
+          static void AMInstallOnWindow(UIWindow *w) {
+              if (!w || w.windowLevel >= UIWindowLevelAlert) return;
+              NSString *n = NSStringFromClass([w class]);
+              if ([n hasPrefix:@"_"] || [n containsString:@"TextEffects"] || [n containsString:@"RemoteKeyboard"]) return;
+              if (objc_getAssociatedObject(w, kWindowKey)) return;
+
+              AMHandler *h = [AMHandler shared];
+              UITapGestureRecognizer *panel =
+                  [[UITapGestureRecognizer alloc] initWithTarget:h action:@selector(onThreeFingerTap:)];
+              panel.numberOfTouchesRequired = 3;
+              panel.numberOfTapsRequired = 1;
+              panel.cancelsTouchesInView = NO;
+              panel.delaysTouchesBegan = NO;
+              panel.delaysTouchesEnded = NO;
+              panel.delegate = h;
+              [w addGestureRecognizer:panel];
+              objc_setAssociatedObject(w, kWindowKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+          }
+
+          static void AMInstallEverywhere(void) {
+              for (UIWindow *w in AMAllWindows()) {
+                  AMInstallOnWindow(w);
+              }
+          }
+
+          #pragma mark - Observadores e inicialização
+
+          static void AMRegisterObservers(void) {
+              NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+              NSOperationQueue *mq = [NSOperationQueue mainQueue];
+              void (^installAll)(NSNotification *) = ^(NSNotification *n) {
+                  AMInstallEverywhere();
+              };
+              [nc addObserverForName:UIWindowDidBecomeVisibleNotification object:nil queue:mq usingBlock:installAll];
+              [nc addObserverForName:UIWindowDidBecomeKeyNotification object:nil queue:mq usingBlock:installAll];
+              [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:mq usingBlock:installAll];
+              if (@available(iOS 13.0, *)) {
+                  [nc addObserverForName:UISceneDidActivateNotification object:nil queue:mq usingBlock:installAll];
+              }
+          }
+
+          __attribute__((constructor))
+          static void AMInit(void) {
+              static BOOL done = NO;
+              if (done) return;
+              done = YES;
+              AMLoadFlags();
+              AMInstallIJKHooks();
+              AMInstallQualityHooks();
+              AMInstallPlayerLanguageHook();
+              AMInstallFrameRateHooks();
+              AMRegisterObservers();
+              AMApplyStatsFlag();
+          }
+          AM_EOF
+
+      - name: Compilar AirMoviePlus.dylib
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -fobjc-arc -O2 \
+            -miphoneos-version-min=12.0 -Wno-deprecated-declarations \
+            -framework Foundation -framework CoreGraphics -framework UIKit \
+            -framework QuartzCore \
+            -install_name @rpath/AirMoviePlus.dylib \
+            -o AirMoviePlus.dylib AirMoviePlus.m
+
+      - name: Verificar o arquivo gerado
+        run: |
+          ls -la AirMoviePlus.dylib
+          lipo -info AirMoviePlus.dylib
+          otool -L AirMoviePlus.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirMoviePlus
+          path: AirMoviePlus.dylib
